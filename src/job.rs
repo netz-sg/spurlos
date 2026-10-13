@@ -2,9 +2,9 @@
 //! Geschrieben wird zuerst in eine versteckte Zwischendatei, damit bei einem
 //! Fehler nie eine halbe Datei oder ein beschädigtes Original zurückbleibt.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::report::Report;
 use crate::{image_strip, video_strip};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -41,7 +41,21 @@ pub struct Options {
     pub ffmpeg: Option<PathBuf>,
 }
 
-pub fn run(input: &Path, kind: Kind, opts: &Options) -> Result<(PathBuf, BTreeSet<String>), String> {
+pub struct Outcome {
+    pub output: PathBuf,
+    pub before: Report,
+    pub after: Report,
+}
+
+pub fn analyze(path: &Path, kind: Kind, ffmpeg: Option<&Path>) -> Result<Report, String> {
+    match kind {
+        Kind::Image => image_strip::analyze(path),
+        Kind::Video => video_strip::analyze(ffmpeg.ok_or("ffmpeg fehlt, Videos sind nicht möglich")?, path),
+    }
+}
+
+/// Bereinigt die Datei und prüft das Ergebnis danach noch einmal.
+pub fn run(input: &Path, kind: Kind, opts: &Options) -> Result<Outcome, String> {
     let output = output_path(input, kind, opts)?;
     let dir = output.parent().ok_or("Ungültiger Zielpfad")?;
     let ext = output.extension().and_then(|e| e.to_str()).unwrap_or_default();
@@ -53,14 +67,15 @@ pub fn run(input: &Path, kind: Kind, opts: &Options) -> Result<(PathBuf, BTreeSe
             video_strip::strip(ffmpeg, input, &tmp, opts.reencode)
         }
     };
-    let removed = result.inspect_err(|_| {
+    let before = result.inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
     std::fs::rename(&tmp, &output).map_err(|e| e.to_string())?;
     if opts.target == Target::Replace && output != input {
         std::fs::remove_file(input).map_err(|e| e.to_string())?;
     }
-    Ok((output, removed))
+    let after = analyze(&output, kind, opts.ffmpeg.as_deref())?;
+    Ok(Outcome { output, before, after })
 }
 
 fn output_path(input: &Path, kind: Kind, opts: &Options) -> Result<PathBuf, String> {

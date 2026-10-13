@@ -2,7 +2,6 @@
 //! nur umverpackt, also ohne Qualitätsverlust. Datenspuren wie GPS-Tracks,
 //! Kapitel, Coverbilder und Encoder-Signaturen im Videostrom fallen weg.
 
-use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,52 +35,97 @@ fn command(program: &Path) -> Command {
     cmd
 }
 
-struct Probe {
-    codec: String,
-    found: BTreeSet<String>,
+use crate::report::Report;
+
+/// Liest Tags, Spuren und Kennungen ohne die Datei zu verändern.
+pub fn analyze(ffmpeg: &Path, input: &Path) -> Result<Report, String> {
+    Ok(probe(ffmpeg, input)?.1)
 }
 
-fn probe(ffmpeg: &Path, input: &Path) -> Result<Probe, String> {
+fn probe(ffmpeg: &Path, input: &Path) -> Result<(String, Report), String> {
     let out = command(ffmpeg).arg("-hide_banner").arg("-i").arg(input).output().map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&out.stderr);
     let mut codec = String::new();
-    let mut found = BTreeSet::new();
+    let mut report = Report::default();
+    let mut camera = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.split_once("Video: ").map(|(_, r)| r) {
             if codec.is_empty() {
                 codec = rest.split([' ', ',']).next().unwrap_or_default().to_string();
             }
             if line.contains("attached pic") {
-                found.insert("Coverbild".into());
+                report.items.insert("Coverbild".into());
             }
         } else if line.contains("Data: ") {
-            found.insert("Datenspur (z.B. GPS oder Sensoren)".into());
+            report.items.insert("Datenspur (z.B. GPS oder Sensoren)".into());
         } else if line.contains("Attachment: ") {
-            found.insert("Anhänge".into());
+            report.items.insert("Anhänge".into());
         } else if line.trim_start().starts_with("Chapter #") {
-            found.insert("Kapitel".into());
+            report.items.insert("Kapitel".into());
         } else if let Some((key, value)) = line.split_once(" : ") {
-            if crate::ai::marker(value.as_bytes()) {
-                found.insert(crate::ai::LABEL.into());
-            }
             let key = key.trim();
-            if !key.is_empty() && key != "language" {
-                found.insert(key.to_string());
+            let technical = key.eq_ignore_ascii_case("duration") || (key == "encoder" && value.trim() == "Lavf");
+            if key.is_empty() || key == "language" || technical {
+                continue;
+            }
+            report.note(key, value.as_bytes());
+            let value = value.split(';').next().unwrap_or_default();
+            let short = key.rsplit('.').next().unwrap_or(key).to_lowercase();
+            match short.as_str() {
+                "location" | "location-eng" | "iso6709" => report.detail("GPS-Position", value),
+                "make" | "model" => camera.push(value.trim().to_string()),
+                "creation_time" | "creationdate" | "date" => report.detail("Aufnahme", value),
+                "software" => report.detail("Software", value),
+                "artist" | "author" => report.detail("Urheber", value),
+                "title" => report.detail("Titel", value),
+                "comment" | "description" => report.detail("Kommentar", value),
+                _ => {}
             }
         }
     }
+    report.detail("Kamera", &camera.join(" "));
     if codec.is_empty() && !text.contains("Audio: ") {
         return Err("Keine Video- oder Tonspur gefunden".into());
     }
-    Ok(Probe { codec, found })
+    if let Some(manifest) = c2pa(input) {
+        report.note("C2PA-Herkunftsnachweis", &manifest);
+    }
+    if let Some(sig) = encoder_signature(input) {
+        report.items.insert("Encoder-Signatur im Videostrom".into());
+        report.detail("Encoder", &sig);
+    }
+    Ok((codec, report))
 }
 
-pub fn strip(ffmpeg: &Path, input: &Path, output: &Path, reencode: bool) -> Result<BTreeSet<String>, String> {
-    let Probe { codec, mut found } = probe(ffmpeg, input)?;
-    if has_c2pa(input) {
-        found.insert("C2PA-Herkunftsnachweis".into());
-        found.insert(crate::ai::LABEL.into());
+/// Sucht am Anfang und Ende der Datei nach Encoder-Kennungen von x264, x265
+/// und ffmpeg. Dort liegen Kopfdaten und der erste Frame.
+fn encoder_signature(path: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut data = Vec::new();
+    (&mut f).take(32 << 20).read_to_end(&mut data).ok()?;
+    if len > 32 << 20 {
+        f.seek(SeekFrom::Start(len.saturating_sub(8 << 20).max(32 << 20))).ok()?;
+        f.read_to_end(&mut data).ok()?;
     }
+    for needle in [&b"x264 - core"[..], b"x265 (build", b"Lavc"] {
+        let mut from = 0;
+        while let Some(pos) = data[from..].windows(needle.len()).position(|w| w == needle).map(|p| p + from) {
+            from = pos + 1;
+            if needle == b"Lavc" && !data.get(pos + 4).is_some_and(u8::is_ascii_digit) {
+                continue;
+            }
+            let tail = &data[pos..data.len().min(pos + 24)];
+            let stop = |b: &u8| !(b.is_ascii_graphic() || *b == b' ' && needle != b"Lavc");
+            let end = tail.iter().position(stop).unwrap_or(tail.len());
+            return Some(String::from_utf8_lossy(&tail[..end]).to_string());
+        }
+    }
+    None
+}
+
+pub fn strip(ffmpeg: &Path, input: &Path, output: &Path, reencode: bool) -> Result<Report, String> {
+    let (codec, report) = probe(ffmpeg, input)?;
     let ext = output.extension().and_then(|e| e.to_str()).unwrap_or_default().to_lowercase();
     let mut cmd = command(ffmpeg);
     cmd.args(["-hide_banner", "-v", "error", "-y", "-i"]).arg(input);
@@ -115,10 +159,7 @@ pub fn strip(ffmpeg: &Path, input: &Path, output: &Path, reencode: bool) -> Resu
         scrub_mp4(output)?;
     }
     scrub_lavc(output)?;
-    if matches!(codec.as_str(), "h264" | "hevc") {
-        found.insert("Encoder-Signatur im Videostrom".into());
-    }
-    Ok(found)
+    Ok(report)
 }
 
 /// Bereinigt den moov-Kopf direkt in der Datei. Die Herstellerkennung FFMP
@@ -182,40 +223,40 @@ fn scrub_lavc(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Sucht auf oberster Ebene nach C2PA-Boxen. ffmpeg übernimmt diese beim
-/// Umverpacken ohnehin nicht, die Suche dient nur der Anzeige.
-fn has_c2pa(path: &Path) -> bool {
+/// Sucht auf oberster Ebene nach C2PA-Boxen und liefert den Anfang des
+/// Manifests. ffmpeg übernimmt diese Boxen beim Umverpacken nicht.
+fn c2pa(path: &Path) -> Option<Vec<u8>> {
     const C2PA_UUID: [u8; 16] = [0xD8, 0xFE, 0xC3, 0xD6, 0x1B, 0x0E, 0x48, 0x3C, 0x92, 0x97, 0x58, 0x28, 0x87, 0x7E, 0xC4, 0x81];
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
-    let len = f.metadata().map_or(0, |m| m.len());
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
     let mut pos = 0;
     while pos + 8 <= len {
-        let mut head = [0u8; 24];
-        if f.seek(SeekFrom::Start(pos)).is_err() || f.read_exact(&mut head[..8]).is_err() {
-            return false;
-        }
+        let mut head = [0u8; 16];
+        f.seek(SeekFrom::Start(pos)).ok()?;
+        f.read_exact(&mut head[..8]).ok()?;
         let mut size = u32::from_be_bytes(head[..4].try_into().unwrap()) as u64;
         let mut body = 8;
-        if size == 1 && f.read_exact(&mut head[8..16]).is_ok() {
-            size = u64::from_be_bytes(head[8..16].try_into().unwrap());
+        if size == 1 {
+            f.read_exact(&mut head[8..]).ok()?;
+            size = u64::from_be_bytes(head[8..].try_into().unwrap());
             body = 16;
+        } else if size == 0 {
+            size = len - pos;
         }
-        match &head[4..8] {
-            b"c2pa" => return true,
-            b"uuid" => {
-                let mut id = [0u8; 16];
-                if f.seek(SeekFrom::Start(pos + body)).is_ok() && f.read_exact(&mut id).is_ok() && id == C2PA_UUID {
-                    return true;
-                }
+        if &head[4..8] == b"c2pa" || &head[4..8] == b"uuid" {
+            let mut data = Vec::new();
+            f.seek(SeekFrom::Start(pos + body)).ok()?;
+            (&mut f).take((size - body).min(1 << 20)).read_to_end(&mut data).ok()?;
+            if &head[4..8] == b"c2pa" || data.starts_with(&C2PA_UUID) {
+                return Some(data);
             }
-            _ => {}
         }
         if size < 8 {
-            return false;
+            return None;
         }
         pos += size;
     }
-    false
+    None
 }
 
 fn patch_moov(d: &mut [u8]) -> bool {

@@ -2,37 +2,52 @@
 //! bereinigt, indem nur die Bildblöcke übernommen werden. Andere Formate und
 //! gedrehte Fotos werden neu kodiert.
 
-use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::path::Path;
 
+use exif::{In, Tag, Value};
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 
+use crate::report::Report;
+
 pub const EXTENSIONS: &[&str] = &["jpg", "jpeg", "jfif", "png", "apng", "webp", "gif", "tif", "tiff", "bmp"];
 
-pub type Removed = BTreeSet<String>;
 type Res<T> = Result<T, String>;
 
-pub fn strip(input: &Path, output: &Path) -> Res<Removed> {
+pub fn strip(input: &Path, output: &Path) -> Res<Report> {
     let data = std::fs::read(input).map_err(|e| e.to_string())?;
-    let format = image::guess_format(&data).map_err(|_| "Unbekanntes Bildformat".to_string())?;
-    let mut removed = Removed::new();
-    let clean = if orientation(&data)? != Orientation::NoTransforms {
-        removed.insert("Ausrichtung (Bild wurde gedreht)".into());
-        reencode(&data, format, &mut removed)?
-    } else {
-        match format {
-            ImageFormat::Jpeg => jpeg(&data, &mut removed)?,
-            ImageFormat::Png => png(&data, &mut removed)?,
-            ImageFormat::WebP => webp(&data, &mut removed)?,
-            ImageFormat::Gif => gif(&data, &mut removed)?,
-            _ => reencode(&data, format, &mut removed)?,
-        }
-    };
+    let (clean, report) = process(&data, true)?;
     std::fs::write(output, clean).map_err(|e| e.to_string())?;
-    Ok(removed)
+    Ok(report)
+}
+
+pub fn analyze(path: &Path) -> Res<Report> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    Ok(process(&data, false)?.1)
+}
+
+fn process(data: &[u8], encode: bool) -> Res<(Vec<u8>, Report)> {
+    let format = image::guess_format(data).map_err(|_| "Unbekanntes Bildformat".to_string())?;
+    let mut report = Report::default();
+    exif_info(data, &mut report);
+    let turned = orientation(data)? != Orientation::NoTransforms;
+    if turned {
+        report.items.insert("Ausrichtung (Bild wird gedreht)".into());
+    }
+    let lossless = match format {
+        ImageFormat::Jpeg => Some(jpeg(data, &mut report)?),
+        ImageFormat::Png => Some(png(data, &mut report)?),
+        ImageFormat::WebP => Some(webp(data, &mut report)?),
+        ImageFormat::Gif => Some(gif(data, &mut report)?),
+        _ => None,
+    };
+    let clean = match lossless {
+        Some(bytes) if !turned => bytes,
+        _ => reencode(data, format, encode, &mut report)?,
+    };
+    Ok((clean, report))
 }
 
 fn decoder(data: &[u8]) -> Res<impl ImageDecoder + '_> {
@@ -44,7 +59,14 @@ fn orientation(data: &[u8]) -> Res<Orientation> {
     Ok(decoder(data)?.orientation().unwrap_or(Orientation::NoTransforms))
 }
 
-fn reencode(data: &[u8], format: ImageFormat, removed: &mut Removed) -> Res<Vec<u8>> {
+fn reencode(data: &[u8], format: ImageFormat, encode: bool, report: &mut Report) -> Res<Vec<u8>> {
+    report.ai.extend(crate::ai::scan(&data[..data.len().min(256 * 1024)]));
+    if !encode {
+        if !report.info.is_empty() || !report.ai.is_empty() {
+            report.items.insert("Metadaten".into());
+        }
+        return Ok(Vec::new());
+    }
     let mut dec = decoder(data)?;
     let turn = dec.orientation().unwrap_or(Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
@@ -56,24 +78,76 @@ fn reencode(data: &[u8], format: ImageFormat, removed: &mut Removed) -> Res<Vec<
         _ => img.write_to(&mut out, format),
     };
     written.map_err(|e| e.to_string())?;
-    note(removed, "Alle Metadaten (neu kodiert)", &data[..data.len().min(256 * 1024)]);
+    report.items.insert("Alle Metadaten (neu kodiert)".into());
     Ok(out.into_inner())
 }
 
-const C2PA: &str = "C2PA-Herkunftsnachweis";
-
-fn note(removed: &mut Removed, label: &str, data: &[u8]) {
-    removed.insert(label.into());
-    if label == C2PA || crate::ai::marker(data) {
-        removed.insert(crate::ai::LABEL.into());
+fn exif_info(data: &[u8], report: &mut Report) {
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut Cursor::new(data)) else { return };
+    let text = |tag| {
+        exif.get_field(tag, In::PRIMARY).map(|f| match &f.value {
+            Value::Ascii(v) => v.iter().map(|s| String::from_utf8_lossy(s).trim().to_string()).collect::<Vec<_>>().join(" "),
+            _ => f.display_value().to_string(),
+        })
+    };
+    let camera: Vec<String> = [text(Tag::Make), text(Tag::Model)].into_iter().flatten().collect();
+    report.detail("Kamera", &camera.join(" "));
+    if let Some(date) = text(Tag::DateTimeOriginal).or_else(|| text(Tag::DateTime)) {
+        report.detail("Aufnahme", &date);
+    }
+    let lat = coord(&exif, Tag::GPSLatitude, Tag::GPSLatitudeRef);
+    let lon = coord(&exif, Tag::GPSLongitude, Tag::GPSLongitudeRef);
+    if let (Some(lat), Some(lon)) = (lat, lon) {
+        report.detail("GPS-Position", &format!("{lat:.5}, {lon:.5}"));
+    }
+    for (tag, label) in [(Tag::Software, "Software"), (Tag::Artist, "Urheber"), (Tag::Copyright, "Copyright"), (Tag::ImageDescription, "Beschreibung")] {
+        if let Some(value) = text(tag) {
+            report.detail(label, &value);
+            report.ai.extend(crate::ai::scan(value.as_bytes()));
+        }
     }
 }
+
+fn coord(exif: &exif::Exif, tag: Tag, side: Tag) -> Option<f64> {
+    let Value::Rational(v) = &exif.get_field(tag, In::PRIMARY)?.value else { return None };
+    let deg = v.first()?.to_f64() + v.get(1)?.to_f64() / 60.0 + v.get(2)?.to_f64() / 3600.0;
+    let side = exif.get_field(side, In::PRIMARY).map(|f| f.display_value().to_string()).unwrap_or_default();
+    Some(if side.contains('S') || side.contains('W') { -deg } else { deg })
+}
+
+fn text_chunk(report: &mut Report, kind: &[u8], body: &[u8]) {
+    let mut parts = body.splitn(2, |&b| b == 0);
+    let key = String::from_utf8_lossy(parts.next().unwrap_or_default()).to_string();
+    let mut rest = parts.next().unwrap_or_default();
+    if kind == b"iTXt" {
+        if rest.first() != Some(&0) {
+            return;
+        }
+        rest = rest.get(2..).unwrap_or_default();
+        for _ in 0..2 {
+            rest = rest.splitn(2, |&b| b == 0).nth(1).unwrap_or_default();
+        }
+    }
+    let label = match key.as_str() {
+        "parameters" | "prompt" => "Prompt",
+        "Description" => "Beschreibung",
+        "Comment" => "Kommentar",
+        "Author" => "Urheber",
+        "Software" => "Software",
+        "Title" => "Titel",
+        "Creation Time" => "Aufnahme",
+        _ => return,
+    };
+    report.detail(label, &String::from_utf8_lossy(rest).replace('\n', " "));
+}
+
+const C2PA: &str = "C2PA-Herkunftsnachweis";
 
 fn broken() -> String {
     "Datei ist beschädigt oder unvollständig".into()
 }
 
-fn jpeg(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
+fn jpeg(d: &[u8], report: &mut Report) -> Res<Vec<u8>> {
     if !d.starts_with(&[0xFF, 0xD8]) {
         return Err(broken());
     }
@@ -94,7 +168,7 @@ fn jpeg(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
         if marker == 0xD9 {
             out.extend_from_slice(&[0xFF, 0xD9]);
             if i + 2 < d.len() {
-                note(removed, "Angehängte Daten", &d[i + 2..]);
+                report.note("Angehängte Daten", &d[i + 2..]);
             }
             return Ok(out);
         }
@@ -108,7 +182,11 @@ fn jpeg(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
         let body = &d[(i + 4).min(end)..end];
         match marker {
             0xEE if body.starts_with(b"Adobe") => out.extend_from_slice(&d[i..end]),
-            0xE0..=0xEF | 0xFE => note(removed, jpeg_label(marker, body), body),
+            0xFE => {
+                report.note("Kommentar", body);
+                report.detail("Kommentar", &String::from_utf8_lossy(body));
+            }
+            0xE0..=0xEF => report.note(jpeg_label(marker, body), body),
             _ => out.extend_from_slice(&d[i..end]),
         }
         i = end;
@@ -142,7 +220,7 @@ fn jpeg_label(marker: u8, body: &[u8]) -> &'static str {
 const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
 const PNG_KEEP: &[&[u8]] = &[b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND", b"acTL", b"fcTL", b"fdAT"];
 
-fn png(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
+fn png(d: &[u8], report: &mut Report) -> Res<Vec<u8>> {
     if !d.starts_with(PNG_SIG) {
         return Err(broken());
     }
@@ -158,7 +236,10 @@ fn png(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
         if PNG_KEEP.contains(&kind) {
             out.extend_from_slice(&d[i..end]);
         } else {
-            note(removed, png_label(kind), &d[i + 8..end - 4]);
+            report.note(png_label(kind), &d[i + 8..end - 4]);
+            if kind == b"tEXt" || kind == b"iTXt" {
+                text_chunk(report, kind, &d[i + 8..end - 4]);
+            }
         }
         i = end;
         if kind == b"IEND" {
@@ -166,7 +247,7 @@ fn png(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
         }
     }
     if i < d.len() {
-        note(removed, "Angehängte Daten", &d[i..]);
+        report.note("Angehängte Daten", &d[i..]);
     }
     Ok(out)
 }
@@ -185,7 +266,7 @@ fn png_label(kind: &[u8]) -> &'static str {
 
 const WEBP_KEEP: &[&[u8]] = &[b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF"];
 
-fn webp(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
+fn webp(d: &[u8], report: &mut Report) -> Res<Vec<u8>> {
     if d.len() < 12 || &d[0..4] != b"RIFF" || &d[8..12] != b"WEBP" {
         return Err(broken());
     }
@@ -196,12 +277,12 @@ fn webp(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
         let len = u32::from_le_bytes(d[i + 4..i + 8].try_into().unwrap()) as usize;
         let end = (i + 8 + len + (len & 1)).min(d.len());
         match id {
-            b"EXIF" => note(removed, "EXIF (Kamera, Datum, GPS)", &d[i..end]),
-            b"XMP " => note(removed, "XMP", &d[i..end]),
-            b"ICCP" => note(removed, "Farbprofil (ICC)", &d[i..end]),
-            b"C2PA" => note(removed, C2PA, &d[i..end]),
+            b"EXIF" => report.note("EXIF (Kamera, Datum, GPS)", &d[i..end]),
+            b"XMP " => report.note("XMP", &d[i..end]),
+            b"ICCP" => report.note("Farbprofil (ICC)", &d[i..end]),
+            b"C2PA" => report.note(C2PA, &d[i..end]),
             _ if WEBP_KEEP.contains(&id) => body.extend_from_slice(&d[i..end]),
-            _ => note(removed, "Sonstige Blöcke", &d[i..end]),
+            _ => report.note("Sonstige Blöcke", &d[i..end]),
         }
         i = end;
     }
@@ -215,7 +296,7 @@ fn webp(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
     Ok(out)
 }
 
-fn gif(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
+fn gif(d: &[u8], report: &mut Report) -> Res<Vec<u8>> {
     if d.len() < 13 || !(d.starts_with(b"GIF87a") || d.starts_with(b"GIF89a")) {
         return Err(broken());
     }
@@ -234,10 +315,10 @@ fn gif(d: &[u8], removed: &mut Removed) -> Res<Vec<u8>> {
                 match label {
                     0xF9 | 0x01 => out.extend_from_slice(&d[i..end]),
                     0xFF if app == b"NETSCAPE2.0" || app == b"ANIMEXTS1.0" => out.extend_from_slice(&d[i..end]),
-                    0xFE => note(removed, "Kommentar", &d[i..end]),
-                    0xFF if app.starts_with(b"XMP Data") => note(removed, "XMP", &d[i..end]),
-                    0xFF if app.starts_with(b"ICCRGBG1") => note(removed, "Farbprofil (ICC)", &d[i..end]),
-                    _ => note(removed, "Anwendungsdaten", &d[i..end]),
+                    0xFE => report.note("Kommentar", &d[i..end]),
+                    0xFF if app.starts_with(b"XMP Data") => report.note("XMP", &d[i..end]),
+                    0xFF if app.starts_with(b"ICCRGBG1") => report.note("Farbprofil (ICC)", &d[i..end]),
+                    _ => report.note("Anwendungsdaten", &d[i..end]),
                 }
                 i = end;
             }

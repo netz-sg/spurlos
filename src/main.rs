@@ -4,6 +4,7 @@ mod ai;
 mod app;
 mod image_strip;
 mod job;
+mod report;
 mod video_strip;
 
 use std::path::PathBuf;
@@ -32,7 +33,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             style(&cc.egui_ctx);
-            Ok(Box::new(app::App::new(files)))
+            Ok(Box::new(app::App::new(cc.egui_ctx.clone(), files)))
         }),
     )
 }
@@ -57,17 +58,38 @@ fn style(ctx: &egui::Context) {
     });
 }
 
-/// Bereinigt die übergebenen Dateien ohne Fenster und legt sie neben dem Original ab.
+/// Ohne Fenster. Mit --check wird nur analysiert, sonst bereinigt und neben
+/// dem Original abgelegt.
 fn cli(args: Vec<String>) {
-    let reencode = args.iter().any(|a| a == "--reencode");
-    let paths = args.into_iter().filter(|a| !a.starts_with("--")).map(PathBuf::from).collect();
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let (check, reencode) = (flag("--check"), flag("--reencode"));
+    let paths = args.iter().filter(|a| !a.starts_with("--")).map(PathBuf::from).collect();
     let opts = job::Options { target: job::Target::Beside, folder: None, reencode, ffmpeg: video_strip::find_ffmpeg() };
     let (mut found, mut skipped) = (Vec::new(), 0);
     job::collect(paths, &mut found, &mut skipped);
     for (path, kind) in found {
-        match job::run(&path, kind, &opts) {
-            Ok((out, removed)) => println!("OK  {} -> {}  [{}]", path.display(), out.display(), Vec::from_iter(removed).join(", ")),
-            Err(e) => println!("ERR {}  {e}", path.display()),
+        println!("{}", path.display());
+        let result = if check {
+            job::analyze(&path, kind, opts.ffmpeg.as_deref()).map(|r| print_report("  ", &r))
+        } else {
+            job::run(&path, kind, &opts).map(|o| {
+                print_report("  vorher ", &o.before);
+                println!("  neu    {}", o.output.display());
+                print_report("  danach ", &o.after);
+                println!("  {}", if o.after.is_clean() { "SAUBER" } else { "NICHT SAUBER" });
+            })
+        };
+        if let Err(e) = result {
+            println!("  FEHLER {e}");
         }
+    }
+}
+
+fn print_report(prefix: &str, r: &report::Report) {
+    let ai = if r.ai.is_empty() { "keine".to_string() } else { Vec::from_iter(r.ai.iter().copied()).join(", ") };
+    println!("{prefix}KI {ai}");
+    println!("{prefix}Daten {}", Vec::from_iter(r.items.iter().cloned()).join(", "));
+    for line in &r.info {
+        println!("{prefix}  {line}");
     }
 }

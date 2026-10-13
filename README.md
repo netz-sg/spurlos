@@ -1,6 +1,19 @@
 # Spurlos
 
-Spurlos entfernt alle Metadaten aus Bildern und Videos. Das Programm läuft auf macOS und Windows und hat eine eigene Oberfläche mit Drag and Drop.
+Spurlos zeigt und entfernt alle Metadaten aus Bildern und Videos. Das Programm läuft auf macOS und Windows und hat eine eigene Oberfläche mit Drag and Drop.
+
+## Analyse beim Einfügen
+
+Jede Datei wird sofort geprüft, bevor etwas verändert wird. Spurlos zeigt dann
+
+- ob eine KI-Kennzeichnung drinsteckt und von welcher Quelle, etwa OpenAI, Midjourney, Stable Diffusion, ComfyUI, Adobe Firefly oder Google
+- Kamera, Aufnahmedatum, GPS-Position, Urheber und Software
+- Prompts aus Stable Diffusion und ComfyUI
+- welche Arten von Metadaten enthalten sind
+
+Fehlt eine KI-Kennzeichnung, beweist das nicht, dass ein Bild echt ist. Viele Plattformen löschen Metadaten beim Hochladen.
+
+Nach dem Bereinigen prüft Spurlos die neue Datei noch einmal mit derselben Analyse und meldet, ob noch etwas gefunden wurde.
 
 ![Icon](assets/icon-256.png)
 
@@ -12,8 +25,6 @@ Spurlos entfernt alle Metadaten aus Bildern und Videos. Das Programm läuft auf 
 - Farbprofile, Zeitstempel und DPI-Angaben
 - angehängte Daten hinter dem Bildende, etwa Bewegtbild-Fotos oder Zusatzbilder
 - bei Videos Titel, Ort, Aufnahmedatum, Gerät, Kapitel, Coverbilder, GPS- und Sensorspuren sowie Encoder-Signaturen im Videostrom
-
-Erkennt Spurlos Hinweise auf KI-Erzeugung, steht in der Liste zusätzlich „KI-Kennzeichnung“ bei den entfernten Daten.
 
 ## Formate
 
@@ -51,6 +62,7 @@ FFMPEG=/pfad/zu/ffmpeg ./scripts/bundle-macos.sh
 
 ```sh
 spurlos --cli datei.jpg ordner/ [--reencode]
+spurlos --cli --check datei.jpg
 ```
 
-Legt die bereinigten Dateien neben den Originalen ab und gibt aus, was entfernt wurde.
+Ohne `--check` werden die bereinigten Dateien neben den Originalen abgelegt und gegengeprüft. Mit `--check` wird nur analysiert.
