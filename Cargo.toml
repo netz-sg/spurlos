@@ -1,0 +1,17 @@
+[package]
+name = "spurlos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.36.2"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp"] }
+rfd = "0.17.2"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+
+[build-dependencies]
+winresource = "0.1.34"
