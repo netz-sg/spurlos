@@ -1,0 +1,33 @@
+name: Windows smoke test
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to test
+        required: true
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release exe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release download $env:TAG --pattern "*windows-x64.exe" --output Spurlos.exe
+
+      - name: Analyse and clean fixtures
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\Spurlos.exe -ArgumentList "--cli","tests\fixtures" -Wait -NoNewWindow -PassThru -RedirectStandardOutput out.txt
+          Get-Content out.txt
+          $text = Get-Content out.txt -Raw
+          $clean = ([regex]::Matches($text, "(?m)^  SAUBER")).Count
+          if ($clean -ne 4 -or $text -match "NICHT SAUBER|FEHLER") { throw "Expected 4 clean files, got $clean" }
+          Get-ChildItem tests\fixtures

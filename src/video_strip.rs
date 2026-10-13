@@ -11,7 +11,7 @@ const MP4_FAMILY: &[&str] = &["mp4", "m4v", "mov", "3gp"];
 
 pub fn find_ffmpeg() -> Option<PathBuf> {
     let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<PathBuf> = embedded().into_iter().collect();
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
         candidates.push(dir.join(name));
         candidates.push(dir.join("../Resources").join(name));
@@ -22,6 +22,34 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
     candidates
         .into_iter()
         .find(|p| command(p).arg("-version").output().is_ok_and(|o| o.status.success()))
+}
+
+/// Release-Builds für Windows tragen ffmpeg in der exe. Beim ersten Start wird
+/// es in den lokalen App-Ordner entpackt und danach wiederverwendet.
+#[cfg(embedded_ffmpeg)]
+fn embedded() -> Option<PathBuf> {
+    const BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ffmpeg.bin"));
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("Spurlos");
+    let name = if cfg!(windows) { format!("ffmpeg-{}.exe", BIN.len()) } else { format!("ffmpeg-{}", BIN.len()) };
+    let path = dir.join(name);
+    if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(BIN.len() as u64) {
+        std::fs::create_dir_all(&dir).ok()?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, BIN).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).ok()?;
+        }
+        std::fs::rename(&tmp, &path).ok()?;
+    }
+    Some(path)
+}
+
+#[cfg(not(embedded_ffmpeg))]
+fn embedded() -> Option<PathBuf> {
+    None
 }
 
 fn command(program: &Path) -> Command {

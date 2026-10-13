@@ -2,6 +2,9 @@
 name = "spurlos"
 version = "0.1.0"
 edition = "2024"
+description = "Shows and removes metadata and AI provenance tags from photos and videos"
+license = "MIT"
+repository = "https://github.com/netz-sg/spurlos"
 
 [dependencies]
 eframe = "0.36.2"
